@@ -116,6 +116,78 @@ function Start-OcxCommand([string[]]$CommandArgs, [switch]$TrackExit) {
   }
 }
 
+function Parse-StartupHealthText([string]$Text) {
+  foreach ($line in ($Text -split "\r?\n")) {
+    $trimmed = $line.Trim()
+    if (-not $trimmed) { continue }
+    try {
+      $parsed = $trimmed | ConvertFrom-Json
+      if ($parsed.status -in @("native", "protected", "at-risk") -and $null -ne $parsed.rebootSafe) {
+        return $parsed
+      }
+    } catch {
+      # A non-JSON line from the CLI (for example a diagnostic banner) is not a
+      # startup-health payload; keep scanning for the actual JSON result.
+      continue
+    }
+  }
+  return $null
+}
+
+function Start-StartupHealthProbe {
+  # Startup safety is machine-local diagnostic state, so the tray asks the CLI to
+  # collect it directly (ocx __startup-health) instead of poking the management API,
+  # which is admin-token gated. The CLI collects the diagnostic straight from the OS,
+  # so it works without the proxy answering and without any credential.
+  #
+  # The child writes into redirected pipes that the tick reads asynchronously: only
+  # the completed Task<string> is ever touched, so a slow or hung diagnostic can never
+  # block the Windows Forms UI thread, and its lifetime is bounded by a kill in the
+  # tick that lets the next refresh replace it instead of stacking another process.
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $BunPath
+    $psi.Arguments = ((@($CliPath, "__startup-health") | ForEach-Object { ConvertTo-NativeArgument $_ }) -join " ")
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables["CODEX_HOME"] = $CodexHome
+    $psi.EnvironmentVariables["OPENCODEX_HOME"] = $OpenCodexHome
+    if ($BunRuntimeSource) {
+      $psi.EnvironmentVariables["OCX_BUN_RUNTIME_SOURCE"] = $BunRuntimeSource
+      $psi.EnvironmentVariables["OCX_BUN_RUNTIME_PATH"] = $BunPath
+    }
+    $process = [System.Diagnostics.Process]::Start($psi)
+    $script:startupProbeProcess = $process
+    # Drain both pipes asynchronously from the start so neither can fill and stall
+    # the child while the tick is only watching the output task's completion.
+    $script:startupProbeOutputTask = $process.StandardOutput.ReadToEndAsync()
+    $script:startupProbeErrorTask = $process.StandardError.ReadToEndAsync()
+    $script:startupProbeStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  } catch {
+    Write-ActionLog "startup-health probe launch failed: $($_.Exception.GetType().Name)"
+    Complete-StartupHealthProbe
+  }
+}
+
+function Complete-StartupHealthProbe {
+  $process = $script:startupProbeProcess
+  $script:startupProbeProcess = $null
+  $script:startupProbeOutputTask = $null
+  $script:startupProbeErrorTask = $null
+  if ($null -ne $process) {
+    try {
+      $process.Dispose()
+    } catch {
+      Write-ActionLog "startup-health probe dispose failed: $($_.Exception.GetType().Name)"
+    }
+  }
+}
+
 function Read-ListenTarget {
   foreach ($path in @((Join-Path $OpenCodexHome "runtime-port.json"), (Join-Path $OpenCodexHome "config.json"))) {
     try {
@@ -172,6 +244,15 @@ $exitItem = $menu.Items.Add("Exit Tray")
 $script:online = $false
 $script:port = 10100
 $script:proxyPid = $null
+$script:wasOnline = $false
+$script:startupHealth = $null
+$script:startupHealthCheckedAt = 0L
+$script:startupRefreshMs = 20000L
+$script:startupProbeProcess = $null
+$script:startupProbeOutputTask = $null
+$script:startupProbeErrorTask = $null
+$script:startupProbeStarted = 0L
+$script:startupProbeTimeoutMs = 30000L
 $script:pendingAction = $null
 $script:pendingStarted = 0L
 $script:pendingDeadline = 0L
@@ -228,18 +309,66 @@ function Update-TrayState {
   $pidMatches = $null -eq $target.pid -or [int]$target.pid -eq [int]$health.pid
   $script:online = $null -ne $health -and $health.status -eq "ok" -and $health.service -eq "opencodex" -and [int]$health.port -eq $script:port -and $pidMatches
   $script:proxyPid = if ($script:online) { [int]$health.pid } else { $null }
+  $cameOnline = $script:online -and -not $script:wasOnline
+  $script:wasOnline = $script:online
   if ($script:online) {
     $statusItem.Text = "Proxy: Online (port $($script:port))"
     $notify.Text = "opencodex: Online"
     $startItem.Enabled = $false
     $stopItem.Enabled = $true
     $restartItem.Enabled = $true
-    try {
-      $startup = Read-JsonUrl "$origin/api/startup-health"
+    # The management API is admin-token gated, so the tray must not poke
+    # /api/startup-health for the icon. Collect the same local diagnostic through the
+    # CLI instead, on a cadence short enough to stay accurate but long enough to avoid
+    # re-running the Windows service-manager probe on every 3s tick. The probe runs as
+    # a detached child whose pipes the tick only reads after completion, so a slow or
+    # hung diagnostic can never freeze the Windows Forms UI thread.
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($null -ne $script:startupProbeProcess) {
+      $probeExited = $false
+      try {
+        $probeExited = $script:startupProbeProcess.HasExited
+      } catch {
+        $probeExited = $true
+      }
+      $probeTimedOut = ($now - $script:startupProbeStarted) -gt $script:startupProbeTimeoutMs
+      if ($probeExited -and $null -ne $script:startupProbeOutputTask -and $script:startupProbeOutputTask.IsCompleted) {
+        $probeStartup = $null
+        try {
+          $probeStartup = Parse-StartupHealthText $script:startupProbeOutputTask.Result
+        } catch {
+          Write-ActionLog "startup-health probe read failed: $($_.Exception.GetType().Name)"
+        }
+        $script:startupHealth = $probeStartup
+        Complete-StartupHealthProbe
+        $script:startupHealthCheckedAt = $now
+      } elseif ($probeTimedOut) {
+        # A hung diagnostic must not survive its refresh slot: terminate it so the
+        # next refresh cannot stack another orphaned Bun process behind it.
+        Write-ActionLog "startup-health probe timed out; terminating it"
+        try {
+          $script:startupProbeProcess.Kill()
+          [void]$script:startupProbeProcess.WaitForExit(3000)
+        } catch {
+          Write-ActionLog "startup-health probe kill failed: $($_.Exception.GetType().Name)"
+        }
+        $script:startupHealth = $null
+        Complete-StartupHealthProbe
+        $script:startupHealthCheckedAt = $now
+      }
+    }
+    if (
+      ($null -eq $script:startupHealth -or $cameOnline -or ($now - $script:startupHealthCheckedAt -gt $script:startupRefreshMs)) -and
+      $null -eq $script:startupProbeProcess
+    ) {
+      Start-StartupHealthProbe
+    }
+    $startup = $script:startupHealth
+    if ($null -ne $startup) {
       $label = if ($startup.status -eq "at-risk") { "At risk" } elseif ($startup.status -eq "protected") { "Protected" } else { "Native routing" }
       $safetyItem.Text = "Restart safety: $label"
       $notify.Icon = if ($startup.status -eq "at-risk") { $warningIcon } else { $onlineIcon }
-    } catch {
+    } else {
       $safetyItem.Text = "Restart safety: unavailable"
       $notify.Icon = $warningIcon
     }

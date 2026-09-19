@@ -380,6 +380,28 @@ describe("Windows tray packaging and command safety", () => {
     expect(source).not.toContain("Stop-Process");
   });
 
+  test("tray reads restart safety through the CLI instead of the admin-gated /api endpoint", () => {
+    const source = readFileSync(repoPath("src", "tray", "windows-tray.ps1"), "utf8");
+    // The management API is admin-token gated, and the tray runs without that token,
+    // so a plain GET /api/startup-health always 401s and leaves the tray stuck on the
+    // yellow warning icon. The tray must collect the same local diagnostic through the
+    // CLI's __startup-health internal command instead.
+    expect(source).toContain('@($CliPath, "__startup-health")');
+    expect(source).not.toContain('Read-JsonUrl "$origin/api/startup-health"');
+    // The local diagnostic does not re-run the Windows service-manager probe on every
+    // 3s tick, so its refresh cadence must stay throttled...
+    expect(source).toContain("$script:startupRefreshMs");
+    expect(source).toContain("$script:startupHealthCheckedAt -gt $script:startupRefreshMs");
+    // ...and it must not block the Windows Forms UI thread. The probe is a detached
+    // child whose stdout pipe is drained asynchronously; the 3s tick only touches the
+    // completed read task, so a slow or hung diagnostic can never freeze the tray menu.
+    expect(source).toContain("ReadToEndAsync()");
+    expect(source).toContain("$script:startupProbeProcess");
+    // A timed-out diagnostic must be terminated, not left to become an orphaned
+    // Bun process on the next refresh.
+    expect(source).toContain("startupProbeProcess.Kill()");
+  });
+
   // This test really does launch PowerShell, which really does launch a Bun child, and
   // then rebinds the port to prove the child did not inherit the listen socket. Those
   // processes ARE the assertion — there is no version of this proof that fakes them.
