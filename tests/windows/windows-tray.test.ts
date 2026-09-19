@@ -405,6 +405,10 @@ describe("Windows tray packaging and command safety", () => {
     // cached health, and records the attempt before spawning the child.
     expect(source).toContain("$script:startupHealthCheckedAt -eq 0 -or");
     expect(source).toContain("# Record the attempt so launch failures and invalid results remain throttled.");
+    // A probe still in flight when the tray shuts down must not outlive it: the
+    // finally block kills the active probe, waits briefly, then completes it.
+    expect(source).toContain("terminating active startup-health probe on tray shutdown");
+    expect(source).toContain("startupProbeProcess.WaitForExit(3000)");
   });
 
   // This test really does launch PowerShell, which really does launch a Bun child, and

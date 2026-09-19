@@ -491,6 +491,19 @@ try {
   if ($null -ne $script:pendingProcess) {
     try { $script:pendingProcess.Dispose() } catch { $null = $_ }
   }
+  if ($null -ne $script:startupProbeProcess) {
+    # A probe still running when the tray shuts down would outlive it: Dispose()
+    # releases the handle but does not terminate the child, so kill the active
+    # probe, wait briefly for exit, then release the probe state.
+    try {
+      Write-ActionLog "terminating active startup-health probe on tray shutdown"
+      $script:startupProbeProcess.Kill()
+      [void]$script:startupProbeProcess.WaitForExit(3000)
+    } catch {
+      Write-ActionLog "startup-health probe shutdown kill failed: $($_.Exception.GetType().Name)"
+    }
+    Complete-StartupHealthProbe
+  }
   $notify.Dispose()
   foreach ($icon in $script:ownedIcons) { $icon.Dispose() }
   $menu.Dispose()
