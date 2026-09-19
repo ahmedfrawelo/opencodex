@@ -409,6 +409,16 @@ describe("Windows tray packaging and command safety", () => {
     // finally block kills the active probe, waits briefly, then completes it.
     expect(source).toContain("terminating active startup-health probe on tray shutdown");
     expect(source).toContain("startupProbeProcess.WaitForExit(3000)");
+    // Probe lifecycle maintenance runs even while the proxy is offline, so a hung
+    // diagnostic is cleaned up outside the online-only UI branch; new probes still
+    // start only while online.
+    expect(source).toContain("$script:online -and ($cameOnline -or $refreshDue)");
+    // The malformed-payload guard requires a real boolean, matching the shared
+    // server-side parser instead of accepting any non-null rebootSafe value.
+    expect(source).toContain("($parsed.rebootSafe -is [bool])");
+    // If the async pipe setup fails after the child started, the child must be
+    // terminated, not merely disposed and lost.
+    expect(source).toContain("would leave the Bun child running");
   });
 
   // This test really does launch PowerShell, which really does launch a Bun child, and

@@ -122,7 +122,7 @@ function Parse-StartupHealthText([string]$Text) {
     if (-not $trimmed) { continue }
     try {
       $parsed = $trimmed | ConvertFrom-Json
-      if ($parsed.status -in @("native", "protected", "at-risk") -and $null -ne $parsed.rebootSafe) {
+      if ($parsed.status -in @("native", "protected", "at-risk") -and ($parsed.rebootSafe -is [bool])) {
         return $parsed
       }
     } catch {
@@ -170,6 +170,16 @@ function Start-StartupHealthProbe {
     $script:startupProbeStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
   } catch {
     Write-ActionLog "startup-health probe launch failed: $($_.Exception.GetType().Name)"
+    if ($null -ne $script:startupProbeProcess) {
+      # Process.Start succeeded but the async pipe setup failed: Dispose alone
+      # would leave the Bun child running, so terminate it before cleanup.
+      try {
+        $script:startupProbeProcess.Kill()
+        [void]$script:startupProbeProcess.WaitForExit(3000)
+      } catch {
+        Write-ActionLog "startup-health probe launch cleanup failed: $($_.Exception.GetType().Name)"
+      }
+    }
     Complete-StartupHealthProbe
   }
 }
@@ -311,6 +321,48 @@ function Update-TrayState {
   $script:proxyPid = if ($script:online) { [int]$health.pid } else { $null }
   $cameOnline = $script:online -and -not $script:wasOnline
   $script:wasOnline = $script:online
+  $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+  if ($null -ne $script:startupProbeProcess) {
+    $probeExited = $false
+    try {
+      $probeExited = $script:startupProbeProcess.HasExited
+    } catch {
+      $probeExited = $true
+    }
+    $probeTimedOut = ($now - $script:startupProbeStarted) -gt $script:startupProbeTimeoutMs
+    if ($probeExited -and $null -ne $script:startupProbeOutputTask -and $script:startupProbeOutputTask.IsCompleted) {
+      $probeStartup = $null
+      try {
+        $probeStartup = Parse-StartupHealthText $script:startupProbeOutputTask.Result
+      } catch {
+        Write-ActionLog "startup-health probe read failed: $($_.Exception.GetType().Name)"
+      }
+      $script:startupHealth = $probeStartup
+      Complete-StartupHealthProbe
+      $script:startupHealthCheckedAt = $now
+    } elseif ($probeTimedOut) {
+      # A hung diagnostic must not survive its refresh slot: terminate it so the
+      # next refresh cannot stack another orphaned Bun process behind it.
+      Write-ActionLog "startup-health probe timed out; terminating it"
+      try {
+        $script:startupProbeProcess.Kill()
+        [void]$script:startupProbeProcess.WaitForExit(3000)
+      } catch {
+        Write-ActionLog "startup-health probe kill failed: $($_.Exception.GetType().Name)"
+      }
+      $script:startupHealth = $null
+      Complete-StartupHealthProbe
+      $script:startupHealthCheckedAt = $now
+    }
+  }
+  $refreshDue =
+    $script:startupHealthCheckedAt -eq 0 -or
+    ($now - $script:startupHealthCheckedAt -gt $script:startupRefreshMs)
+  if ($script:online -and ($cameOnline -or $refreshDue) -and $null -eq $script:startupProbeProcess) {
+    # Record the attempt so launch failures and invalid results remain throttled.
+    $script:startupHealthCheckedAt = $now
+    Start-StartupHealthProbe
+  }
   if ($script:online) {
     $statusItem.Text = "Proxy: Online (port $($script:port))"
     $notify.Text = "opencodex: Online"
@@ -318,53 +370,9 @@ function Update-TrayState {
     $stopItem.Enabled = $true
     $restartItem.Enabled = $true
     # The management API is admin-token gated, so the tray must not poke
-    # /api/startup-health for the icon. Collect the same local diagnostic through the
-    # CLI instead, on a cadence short enough to stay accurate but long enough to avoid
-    # re-running the Windows service-manager probe on every 3s tick. The probe runs as
-    # a detached child whose pipes the tick only reads after completion, so a slow or
-    # hung diagnostic can never freeze the Windows Forms UI thread.
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    if ($null -ne $script:startupProbeProcess) {
-      $probeExited = $false
-      try {
-        $probeExited = $script:startupProbeProcess.HasExited
-      } catch {
-        $probeExited = $true
-      }
-      $probeTimedOut = ($now - $script:startupProbeStarted) -gt $script:startupProbeTimeoutMs
-      if ($probeExited -and $null -ne $script:startupProbeOutputTask -and $script:startupProbeOutputTask.IsCompleted) {
-        $probeStartup = $null
-        try {
-          $probeStartup = Parse-StartupHealthText $script:startupProbeOutputTask.Result
-        } catch {
-          Write-ActionLog "startup-health probe read failed: $($_.Exception.GetType().Name)"
-        }
-        $script:startupHealth = $probeStartup
-        Complete-StartupHealthProbe
-        $script:startupHealthCheckedAt = $now
-      } elseif ($probeTimedOut) {
-        # A hung diagnostic must not survive its refresh slot: terminate it so the
-        # next refresh cannot stack another orphaned Bun process behind it.
-        Write-ActionLog "startup-health probe timed out; terminating it"
-        try {
-          $script:startupProbeProcess.Kill()
-          [void]$script:startupProbeProcess.WaitForExit(3000)
-        } catch {
-          Write-ActionLog "startup-health probe kill failed: $($_.Exception.GetType().Name)"
-        }
-        $script:startupHealth = $null
-        Complete-StartupHealthProbe
-        $script:startupHealthCheckedAt = $now
-      }
-    }
-    $refreshDue =
-      $script:startupHealthCheckedAt -eq 0 -or
-      ($now - $script:startupHealthCheckedAt -gt $script:startupRefreshMs)
-    if (($cameOnline -or $refreshDue) -and $null -eq $script:startupProbeProcess) {
-      # Record the attempt so launch failures and invalid results remain throttled.
-      $script:startupHealthCheckedAt = $now
-      Start-StartupHealthProbe
-    }
+    # /api/startup-health for the icon. The probe lifecycle maintenance and the
+    # refresh gate above run on every tick (even while offline) so a hung
+    # diagnostic is cleaned up outside the online-only UI branch.
     $startup = $script:startupHealth
     if ($null -ne $startup) {
       $label = if ($startup.status -eq "at-risk") { "At risk" } elseif ($startup.status -eq "protected") { "Protected" } else { "Native routing" }
