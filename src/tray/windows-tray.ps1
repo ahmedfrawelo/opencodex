@@ -357,10 +357,12 @@ function Update-TrayState {
         $script:startupHealthCheckedAt = $now
       }
     }
-    if (
-      ($null -eq $script:startupHealth -or $cameOnline -or ($now - $script:startupHealthCheckedAt -gt $script:startupRefreshMs)) -and
-      $null -eq $script:startupProbeProcess
-    ) {
+    $refreshDue =
+      $script:startupHealthCheckedAt -eq 0 -or
+      ($now - $script:startupHealthCheckedAt -gt $script:startupRefreshMs)
+    if (($cameOnline -or $refreshDue) -and $null -eq $script:startupProbeProcess) {
+      # Record the attempt so launch failures and invalid results remain throttled.
+      $script:startupHealthCheckedAt = $now
       Start-StartupHealthProbe
     }
     $startup = $script:startupHealth

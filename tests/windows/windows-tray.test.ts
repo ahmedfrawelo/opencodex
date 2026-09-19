@@ -400,6 +400,11 @@ describe("Windows tray packaging and command safety", () => {
     // A timed-out diagnostic must be terminated, not left to become an orphaned
     // Bun process on the next refresh.
     expect(source).toContain("startupProbeProcess.Kill()");
+    // A launch failure or invalid result must not start a new probe on the very next
+    // 3s tick: the refresh decides by the throttled attempt timestamp, never by a null
+    // cached health, and records the attempt before spawning the child.
+    expect(source).toContain("$script:startupHealthCheckedAt -eq 0 -or");
+    expect(source).toContain("# Record the attempt so launch failures and invalid results remain throttled.");
   });
 
   // This test really does launch PowerShell, which really does launch a Bun child, and
