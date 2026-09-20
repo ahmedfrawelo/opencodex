@@ -135,7 +135,9 @@ try {
 }
 if (-not $childGone) {
   # Safety: never leak the sleeper even when the behavior under test regresses.
-  try { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue } catch { }
+  try { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue } catch {
+    # The child exited between the liveness check and the cleanup kill.
+  }
 }
 
 $pidFile = $env:OCX_PROBE_TEST_PID_FILE
