@@ -420,7 +420,9 @@ describe("Windows tray packaging and command safety", () => {
     // line-anchored regex (not a substring) because the `$script:proxyPid`
     // assignment a few lines above contains the same `if ($script:online) {`
     // text inline.
-    const timeoutAnchorIdx = source.indexOf("startup-health probe timed out; terminating it");
+    const timeoutAnchorIdx = source.search(
+      /^\s*} elseif \(\$probeTimedOut\) \{$/m,
+    );
     const onlineBranchIdx = source.search(/^\s*if \(\$script:online\) \{$/m);
     expect(timeoutAnchorIdx).toBeGreaterThanOrEqual(0);
     expect(onlineBranchIdx).toBeGreaterThanOrEqual(0);
