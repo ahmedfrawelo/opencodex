@@ -411,11 +411,22 @@ describe("Windows tray packaging and command safety", () => {
     // finally block kills the active probe, waits briefly, then completes it.
     expect(source).toContain("terminating active startup-health probe on tray shutdown");
     expect(source).toContain("startupProbeProcess.WaitForExit(3000)");
-    // Probe lifecycle placement (maintenance outside the online-only UI branch)
-    // and hung-child termination are proven behaviorally by "terminates a hung
-    // startup-health probe without stacking a replacement" below. A
-    // placement-blind substring cannot tell inside the branch from outside it,
-    // so no source-text assertion pins that here.
+    // Placement proof that runs on every platform: the behavioral test below is
+    // win32-only and the Windows CI leg runs on dispatch rather than on PRs,
+    // so merge-time coverage needs a lightweight check here too. The timeout
+    // maintenance must sit BEFORE the online-only UI branch: moving it inside
+    // flips the order and deleting it removes the anchor, and a plain
+    // substring could not tell inside from outside. The branch anchor is a
+    // line-anchored regex (not a substring) because the `$script:proxyPid`
+    // assignment a few lines above contains the same `if ($script:online) {`
+    // text inline.
+    const timeoutAnchorIdx = source.indexOf("startup-health probe timed out; terminating it");
+    const onlineBranchIdx = source.search(/^\s*if \(\$script:online\) \{$/m);
+    expect(timeoutAnchorIdx).toBeGreaterThanOrEqual(0);
+    expect(onlineBranchIdx).toBeGreaterThanOrEqual(0);
+    expect(timeoutAnchorIdx).toBeLessThan(onlineBranchIdx);
+    // Hung-child termination itself is proven behaviorally by "terminates a hung
+    // startup-health probe without stacking a replacement" below.
     // The malformed-payload guard requires a real boolean, matching the shared
     // server-side parser instead of accepting any non-null rebootSafe value.
     expect(source).toContain("($parsed.rebootSafe -is [bool])");

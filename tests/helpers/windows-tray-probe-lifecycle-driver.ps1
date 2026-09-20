@@ -102,61 +102,77 @@ $script:pendingDeadline = 0
 $script:pendingOldProxyPid = $null
 $script:pendingProcess = $null
 
-if ($Scenario -eq "Online") {
-  # First tick settles wasOnline and launches the probe through the real
-  # cameOnline gate against the fake /healthz the caller serves.
-  Update-TrayState
-  if (-not $script:online) { throw "online scenario never came online" }
-  if ($null -eq $script:startupProbeProcess) { throw "cameOnline gate did not launch a probe" }
-} else {
-  # Stage the exact state the maintenance branch must handle: a probe in flight
-  # while the proxy is down.
-  Start-StartupHealthProbe
-  if ($null -eq $script:startupProbeProcess) { throw "probe did not start" }
-}
-$childPid = $script:startupProbeProcess.Id
-Start-Sleep -Milliseconds 500
-$script:startupProbeStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:startupProbeTimeoutMs - 5000
-
-$watch = [System.Diagnostics.Stopwatch]::StartNew()
-Update-TrayState
-$maintenanceMs = $watch.ElapsedMilliseconds
-$onlineObserved = $script:online
-$probeAfterMaintenance = $script:startupProbeProcess
-Update-TrayState
-$watch.Stop()
-
-$childGone = $false
+$childPid = 0
 try {
-  $live = Get-Process -Id $childPid -ErrorAction Stop
-  $childGone = $live.HasExited
-} catch {
-  $childGone = $true
-}
-if (-not $childGone) {
-  # Safety: never leak the sleeper even when the behavior under test regresses.
-  try { Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue } catch {
-    # The child exited between the liveness check and the cleanup kill.
+  if ($Scenario -eq "Online") {
+    # First tick settles wasOnline and launches the probe through the real
+    # cameOnline gate against the fake /healthz the caller serves.
+    Update-TrayState
+    if (-not $script:online) { throw "online scenario never came online" }
+    if ($null -eq $script:startupProbeProcess) { throw "cameOnline gate did not launch a probe" }
+  } else {
+    # Stage the exact state the maintenance branch must handle: a probe in flight
+    # while the proxy is down.
+    Start-StartupHealthProbe
+    if ($null -eq $script:startupProbeProcess) { throw "probe did not start" }
+  }
+  $childPid = $script:startupProbeProcess.Id
+  Start-Sleep -Milliseconds 500
+  # The timeout branch is only proven while the child is still alive here: an
+  # already-exited child would take the exited-probe path and every assertion
+  # below would pass without the Kill() ever running.
+  if ($script:startupProbeProcess.HasExited) { throw "probe child exited before maintenance; the timeout path was not exercised" }
+  $script:startupProbeStarted = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $script:startupProbeTimeoutMs - 5000
+
+  $watch = [System.Diagnostics.Stopwatch]::StartNew()
+  Update-TrayState
+  $maintenanceMs = $watch.ElapsedMilliseconds
+  $onlineObserved = $script:online
+  $probeAfterMaintenance = $script:startupProbeProcess
+  Update-TrayState
+  $watch.Stop()
+
+  # Liveness is evaluated BEFORE the safety cleanup in finally, so the verdict
+  # reports what the maintenance branch did, not what the driver cleaned up.
+  $childGone = $false
+  try {
+    $live = Get-Process -Id $childPid -ErrorAction Stop
+    $childGone = $live.HasExited
+  } catch {
+    $childGone = $true
+  }
+
+  $pidFile = $env:OCX_PROBE_TEST_PID_FILE
+  $launches = 0
+  if ($pidFile -and (Test-Path -LiteralPath $pidFile)) {
+    $launches = @((Get-Content -LiteralPath $pidFile | Where-Object { $_.Trim() -ne "" })).Count
+  }
+
+  $verdict = [PSCustomObject]@{
+    scenario = $Scenario
+    onlineObserved = [bool]$onlineObserved
+    maintenanceMs = $maintenanceMs
+    totalMs = $watch.ElapsedMilliseconds
+    childPid = $childPid
+    childTerminated = [bool]$childGone
+    probeCleared = ($null -eq $probeAfterMaintenance) -and ($null -eq $script:startupProbeProcess)
+    launches = $launches
+  }
+  $verdictJson = $verdict | ConvertTo-Json -Compress
+  # Set-Content -Encoding UTF8 emits a BOM on Windows PowerShell 5.1; write raw
+  # BOM-less UTF-8 the way the tray writes its heartbeat file.
+  [System.IO.File]::WriteAllText($ResultPath, $verdictJson, (New-Object System.Text.UTF8Encoding($false)))
+} finally {
+  # Process.Start returns before the fake CLI writes its pid file, so a throw
+  # above (before that write) would leave the outer cleanup with no pid and a
+  # 120s sleeper behind. The in-hand pid closes that race.
+  if ($childPid -gt 0) {
+    try {
+      $leftover = Get-Process -Id $childPid -ErrorAction Stop
+      if (-not $leftover.HasExited) { Stop-Process -Id $childPid -Force -ErrorAction Stop }
+    } catch {
+      # Already exited or reaped; the verdict above already recorded the outcome.
+      $null = $_
+    }
   }
 }
-
-$pidFile = $env:OCX_PROBE_TEST_PID_FILE
-$launches = 0
-if ($pidFile -and (Test-Path -LiteralPath $pidFile)) {
-  $launches = @((Get-Content -LiteralPath $pidFile | Where-Object { $_.Trim() -ne "" })).Count
-}
-
-$verdict = [PSCustomObject]@{
-  scenario = $Scenario
-  onlineObserved = [bool]$onlineObserved
-  maintenanceMs = $maintenanceMs
-  totalMs = $watch.ElapsedMilliseconds
-  childPid = $childPid
-  childTerminated = [bool]$childGone
-  probeCleared = ($null -eq $probeAfterMaintenance) -and ($null -eq $script:startupProbeProcess)
-  launches = $launches
-}
-$verdictJson = $verdict | ConvertTo-Json -Compress
-# Set-Content -Encoding UTF8 emits a BOM on Windows PowerShell 5.1; write raw
-# BOM-less UTF-8 the way the tray writes its heartbeat file.
-[System.IO.File]::WriteAllText($ResultPath, $verdictJson, (New-Object System.Text.UTF8Encoding($false)))
