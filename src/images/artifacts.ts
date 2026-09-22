@@ -334,6 +334,10 @@ async function connectPublicHttps(
       // cap entirely instead of inheriting a default. Keep the 50 MiB ceiling when a
       // caller omits a limit, and honour an explicit tighter one.
       maxBytes: options.maxBytes ?? MAX_DOWNLOAD_BYTES,
+      // Bound the TCP/TLS setup phase: without this, a peer that never completes
+      // the handshake hangs past every idle timer, which only starts once the
+      // connection exists. Covers image and video downloads (both go through here).
+      connectTimeoutMs: DOWNLOAD_CONNECT_TIMEOUT_MS,
       context: `${options.context} download`,
     }));
   return download(url, pinned, options.signal);
